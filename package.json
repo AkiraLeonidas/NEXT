@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "node --test \"tests/*.test.ts\""
+    "test": "node --test \"tests/*.test.ts\"",
+    "test:e2e": "node tests/e2e/next.e2e.mjs"
   },
   "dependencies": {
     "react": "^19.3.1",
@@ -20,6 +21,7 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
     "oxlint": "^1.89.0",
+    "playwright-core": "^1.49.1",
     "typescript": "~7.0.2",
     "vite": "^8.3.5"
   }

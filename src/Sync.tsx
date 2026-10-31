@@ -4,6 +4,7 @@ import type { Conflict, UpdatePayload } from './ai/sync.ts'
 import { detectKind, execute, parseUpdate, planText, setupPrompt } from './ai/sync.ts'
 import type { Decisions, FullPlan } from './ai/fullplan.ts'
 import { fullPlanSetupPrompt, parseFullPlan, reconcile } from './ai/fullplan.ts'
+import { buildHandover, sensitiveHints } from './ai/handover.ts'
 
 type Pending =
   | { type: 'update'; update: UpdatePayload; hash: string; conflicts: Conflict[]; useTheirs: Set<string> }
@@ -40,6 +41,7 @@ export default function SyncView({ state, today, onApply, onApplyPlan, onAlready
   const [status, setStatus] = useState('')
   const [pending, setPending] = useState<Pending | null>(null)
   const [fallbackCopy, setFallbackCopy] = useState('')
+  const [handover, setHandover] = useState<string | null>(null)
 
   const process = (raw: string) => {
     setErrors([])
@@ -88,6 +90,30 @@ export default function SyncView({ state, today, onApply, onApplyPlan, onAlready
       setFallbackCopy(content)
       setStatus('Couldn’t copy automatically. Select the text below and copy it.')
     }
+  }
+
+  // ---- handover preview: nothing leaves the app until the user taps Copy
+  if (handover !== null) {
+    const ownText = [...state.tasks.filter((t) => !t.cancelled).flatMap((t) => [t.title, t.notes]), ...state.thoughts.map((t) => t.text)].join('\n')
+    const hints = sensitiveHints(ownText)
+    return (
+      <section className="sync">
+        <h1 className="page-title">Handover</h1>
+        <div className="warning" role="note">
+          <strong>This copies your task list into ChatGPT.</strong>
+          <p>Titles, notes, dates, categories and Inbox ideas are included, so OpenAI will receive them when you paste. Photos, photo names and photo links are never included. Nothing is sent automatically: it only goes to your clipboard.</p>
+          {hints.length > 0 && <p className="warning-strong">Your tasks seem to contain {hints.join(', ')}. Remove them from the task first if you don’t want ChatGPT to see them.</p>}
+        </div>
+        <textarea className="input dump-reply" readOnly value={handover} aria-label="Handover preview" onFocus={(e) => e.target.select()} />
+        <p className="hint left">{handover.length.toLocaleString('en-GB')} characters. Paste it as the first message in a new ChatGPT chat.</p>
+        <div className="actions">
+          <button className="btn primary big" onClick={() => copy(handover, 'Handover copied. Paste it into a new ChatGPT chat.')}>Copy handover</button>
+          <button className="btn ghost" onClick={() => { setHandover(null); setFallbackCopy(''); setStatus('') }}>Back</button>
+        </div>
+        {status && !fallbackCopy && <p className="hint" role="status">{status}</p>}
+        {fallbackCopy && <p className="hint" role="status">Couldn’t copy automatically. Tap the preview above, then Select All and Copy.</p>}
+      </section>
+    )
   }
 
   // ---- review of a full plan: only uncertain matches and real conflicts
@@ -192,6 +218,10 @@ export default function SyncView({ state, today, onApply, onApplyPlan, onAlready
       <button className="btn secondary" onClick={() => copy(fullPlanSetupPrompt(), 'Setup copied. Paste it once into your ChatGPT chat and pin it.')}>
         First time? Copy ChatGPT setup
       </button>
+      <button className="btn secondary" onClick={() => { setStatus(''); setFallbackCopy(''); setHandover(buildHandover(state, new Date(), today)) }}>
+        Copy complete ChatGPT handover
+      </button>
+      <p className="hint left">For a new ChatGPT chat: your workflow, plan format, rules and current tasks in one message. You’ll see it before anything is copied.</p>
 
       <details className="advanced">
         <summary>Advanced</summary>

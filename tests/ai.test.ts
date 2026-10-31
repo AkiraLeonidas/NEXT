@@ -120,7 +120,8 @@ test('import: urgent first, tomorrow scheduled, later → inbox, new categories,
   const items = buildReview(valid, s, TODAY)
   s = reduce(s, { type: 'import', ...toImport(items, TODAY) }, TODAY)
 
-  assert.deepEqual(queue(s, TODAY).map((t) => t.title), ['Eksisterende opgave', 'Ring til tandlægen', 'Køb mælk'])
+  // V2 priority engine: the new high-priority task with a deadline outranks the older medium one.
+  assert.deepEqual(queue(s, TODAY).map((t) => t.title), ['Ring til tandlægen', 'Eksisterende opgave', 'Køb mælk'])
   const dentist = s.tasks.find((t) => t.title === 'Ring til tandlægen')!
   assert.equal(dentist.priority, 'high')
   assert.equal(dentist.deadline, '2026-11-06')

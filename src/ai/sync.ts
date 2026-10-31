@@ -11,7 +11,7 @@
 //    the user decides (default: keep theirs). Changes ChatGPT made itself never conflict.
 
 import type { Field, Priority, State, Task } from '../store.ts'
-import { PRIORITIES, TRACKED, addDays, commit, isRealDate, transition, withApplied } from '../store.ts'
+import { PRIORITIES, TRACKED, addDays, commit, doneDay, isRealDate, nowQueue, transition, withApplied } from '../store.ts'
 import { normalize } from './review.ts'
 import { extractJson } from './schema.ts'
 
@@ -304,18 +304,20 @@ const WEEKDAYS_DA = ['søndag', 'mandag', 'tirsdag', 'onsdag', 'torsdag', 'freda
 export type PlanTask = {
   id: string; title: string; when: 'today' | 'tomorrow' | 'later'; day?: string
   priority?: Priority; deadline?: string; category?: string; notes?: string; done?: true
+  overdue_since?: string // still actionable today; originally scheduled for this day
 }
 export type Plan = {
   next_plan: typeof UPDATE_VERSION; rev: number; date: string; weekday: string; new_id_prefix: string
   tasks: PlanTask[]; ideas: string[]
 }
 
-/** Compact snapshot for ChatGPT: today's queue in order, today's done tasks, then upcoming. */
+/** Compact snapshot for ChatGPT: today's queue in order (incl. overdue), today's done tasks, then upcoming. */
 export function buildPlan(state: State, today: string): Plan {
   const tomorrow = addDays(today, 1)
-  const visible = state.tasks.filter((t) => !t.cancelled && (t.done ? t.day === today : t.day >= today))
-  const group = (t: Task) => (t.day === today ? (t.done ? 1 : 0) : 2)
-  visible.sort((a, b) => group(a) - group(b) || a.day.localeCompare(b.day) || a.order - b.order)
+  const now = nowQueue(state, today)
+  const done = state.tasks.filter((t) => !t.cancelled && t.done && (t.day === today || doneDay(t) === today))
+  const upcoming = state.tasks.filter((t) => !t.cancelled && !t.done && t.day > today).sort((a, b) => a.day.localeCompare(b.day) || a.order - b.order)
+  const visible = [...now, ...done, ...upcoming]
   const [y, m, d] = today.split('-').map(Number)
   return {
     next_plan: UPDATE_VERSION,
@@ -324,8 +326,9 @@ export function buildPlan(state: State, today: string): Plan {
     weekday: WEEKDAYS_DA[new Date(y, m - 1, d).getDay()],
     new_id_prefix: `c${state.rev}-`,
     tasks: visible.map((t) => {
-      const when = t.day === today ? 'today' : t.day === tomorrow ? 'tomorrow' : 'later'
+      const when = t.day <= today || t.done ? 'today' : t.day === tomorrow ? 'tomorrow' : 'later'
       const p: PlanTask = { id: t.id, title: t.title, when }
+      if (!t.done && t.day < today) p.overdue_since = t.day
       if (when === 'later') p.day = t.day
       if (t.priority) p.priority = t.priority
       if (t.deadline) p.deadline = t.deadline

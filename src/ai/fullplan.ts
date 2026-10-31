@@ -9,6 +9,10 @@
 //    it becomes a conflict for the user to decide ("Keep mine" is remembered).
 //  - Uncertain matches (similar titles) are confirmed in a review.
 //  - Validation is all-or-nothing; the same plan pasted twice is a no-op.
+//  - An overdue task that the plan keeps "today" keeps its original scheduled date.
+//
+// Version 2 adds "urgency" and "importance" (ChatGPT's semantic judgement, used by the
+// local priority engine). Version 1 plans are still accepted unchanged.
 
 import type { Field, Priority, State, Task } from '../store.ts'
 import { PRIORITIES, TRACKED, addDays, commit, isRealDate, nextTaskId, transition, withApplied } from '../store.ts'
@@ -16,7 +20,8 @@ import { isSimilar, normalize } from './review.ts'
 import { extractJson } from './schema.ts'
 import { fingerprint } from './sync.ts'
 
-export const FULL_PLAN_VERSION = 1
+export const FULL_PLAN_VERSION = 2
+export const FULL_PLAN_VERSIONS = [1, 2] as const
 export const LIMITS = { tasks: 100, ideas: 50, title: 120, notes: 500, category: 30, idea: 500 }
 
 export type PlanStatus = 'open' | 'done' | 'cancelled'
@@ -30,8 +35,10 @@ export type FullPlanTask = {
   when: 'today' | 'tomorrow' | 'later'
   day: string | null // required when "when" is "later"
   status: PlanStatus
+  urgency?: Priority // v2: required there
+  importance?: Priority // v2: required there
 }
-export type FullPlan = { next_full_plan: typeof FULL_PLAN_VERSION; date: string; tasks: FullPlanTask[]; ideas: { text: string }[] }
+export type FullPlan = { next_full_plan: (typeof FULL_PLAN_VERSIONS)[number]; date: string; tasks: FullPlanTask[]; ideas: { text: string }[] }
 
 const nullable = (schema: object) => ({ anyOf: [schema, { type: 'null' }] })
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$' }
@@ -40,7 +47,7 @@ const KEY_RE = /^[a-z0-9][a-z0-9-]{0,39}$/
 /** Strict JSON Schema (also in docs/next-full-plan.schema.json). Every field is required; use null for "none". */
 export const FULL_PLAN_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
-  title: 'NEXT full plan v1',
+  title: 'NEXT full plan v2',
   type: 'object',
   additionalProperties: false,
   required: ['next_full_plan', 'date', 'tasks', 'ideas'],
@@ -50,19 +57,21 @@ export const FULL_PLAN_SCHEMA = {
     tasks: {
       type: 'array',
       maxItems: LIMITS.tasks,
-      description: 'In the order to work on them. Keys and titles must be unique.',
+      description: 'Suggested working order (NEXT ranks locally; order breaks ties). Keys and titles must be unique.',
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['key', 'title', 'notes', 'priority', 'deadline', 'category', 'when', 'day', 'status'],
+        required: ['key', 'title', 'notes', 'priority', 'urgency', 'importance', 'deadline', 'category', 'when', 'day', 'status'],
         properties: {
           key: { type: 'string', pattern: '^[a-z0-9][a-z0-9-]{0,39}$', description: 'Stable ID chosen by ChatGPT; keep it the same for the same task in every plan' },
           title: { type: 'string', minLength: 1, maxLength: LIMITS.title },
           notes: nullable({ type: 'string', maxLength: LIMITS.notes }),
           priority: { type: 'string', enum: PRIORITIES },
-          deadline: nullable(DATE),
+          urgency: { type: 'string', enum: PRIORITIES, description: 'How time-critical it is' },
+          importance: { type: 'string', enum: PRIORITIES, description: 'How much it matters' },
+          deadline: { ...nullable(DATE), description: 'Hard deadline only (a real consequence if missed); otherwise null' },
           category: nullable({ type: 'string', maxLength: LIMITS.category }),
-          when: { type: 'string', enum: ['today', 'tomorrow', 'later'] },
+          when: { type: 'string', enum: ['today', 'tomorrow', 'later'], description: 'Flexible scheduled day, not a deadline' },
           day: { ...nullable(DATE), description: 'Required when "when" is "later", otherwise null' },
           status: { type: 'string', enum: ['open', 'done', 'cancelled'] },
         },
@@ -79,6 +88,7 @@ export const FULL_PLAN_SCHEMA = {
 // ---------- validation
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const V1_TASK_FIELDS = FULL_PLAN_SCHEMA.properties.tasks.items.required.filter((k) => k !== 'urgency' && k !== 'importance')
 
 export type ParsedPlan = { ok: true; plan: FullPlan; hash: string } | { ok: false; errors: string[] }
 
@@ -98,7 +108,9 @@ export function parseFullPlan(raw: string, today: string): ParsedPlan {
     for (const k of Object.keys(obj)) if (!keys.includes(k)) errors.push(`${at}: unknown field "${k}".`)
   }
   exact(data, FULL_PLAN_SCHEMA.required, 'Plan')
-  if (data.next_full_plan !== FULL_PLAN_VERSION) errors.push(`next_full_plan must be ${FULL_PLAN_VERSION}.`)
+  const version = data.next_full_plan
+  if (!FULL_PLAN_VERSIONS.includes(version as 1 | 2)) errors.push(`next_full_plan must be ${FULL_PLAN_VERSION}.`)
+  const taskFields = version === 1 ? V1_TASK_FIELDS : FULL_PLAN_SCHEMA.properties.tasks.items.required
   if (typeof data.date !== 'string' || !isRealDate(data.date)) errors.push('date must be a real date YYYY-MM-DD.')
   else if (data.date < today) errors.push(`This plan is for ${data.date}, which has passed. Ask ChatGPT for today's plan (${today}).`)
   const tasks = Array.isArray(data.tasks) ? data.tasks : (errors.push('tasks must be a list.'), [])
@@ -111,7 +123,7 @@ export function parseFullPlan(raw: string, today: string): ParsedPlan {
   tasks.forEach((t: unknown, i: number) => {
     const at = `Task ${i + 1}`
     if (!isObj(t)) return void errors.push(`${at}: must be an object.`)
-    exact(t, FULL_PLAN_SCHEMA.properties.tasks.items.required, at)
+    exact(t, taskFields, at)
     const name = typeof t.title === 'string' && t.title.trim() ? `${at} (“${t.title.trim().slice(0, 40)}”)` : at
     const text = (k: string, max: number, nullable: boolean) => {
       const v = t[k]
@@ -130,7 +142,9 @@ export function parseFullPlan(raw: string, today: string): ParsedPlan {
     }
     text('notes', LIMITS.notes, true)
     text('category', LIMITS.category, true)
-    if (!PRIORITIES.includes(t.priority as Priority)) errors.push(`${name}: "priority" must be high, medium or low.`)
+    for (const k of version === 1 ? ['priority'] : ['priority', 'urgency', 'importance']) {
+      if (!PRIORITIES.includes(t[k] as Priority)) errors.push(`${name}: "${k}" must be high, medium or low.`)
+    }
     if (t.deadline !== null && !(typeof t.deadline === 'string' && isRealDate(t.deadline))) errors.push(`${name}: "deadline" must be YYYY-MM-DD or null.`)
     if (!['today', 'tomorrow', 'later'].includes(t.when as string)) errors.push(`${name}: "when" must be today, tomorrow or later.`)
     if (t.when === 'later') {
@@ -203,7 +217,7 @@ export function reconcile(state: State, plan: FullPlan, today: string, decisions
       const day = dayFor(inc)
       s = transition(s, {
         type: 'add', id, title, day, notes: inc.notes ?? undefined, category: inc.category?.trim() || undefined,
-        priority: inc.priority, deadline: inc.deadline ?? undefined,
+        priority: inc.priority, deadline: inc.deadline ?? undefined, urgency: inc.urgency, importance: inc.importance,
       }, today)
       s = { ...s, seq: Math.max(s.seq, Number(id.slice(1)) || s.seq) }
       if (inc.category?.trim()) s = transition(s, { type: 'addCategory', name: inc.category }, today)
@@ -244,9 +258,11 @@ export function reconcile(state: State, plan: FullPlan, today: string, decisions
       changed = true
     }
 
+    // "today" for a task that is already overdue means "still actionable": keep its original date.
+    const day = t.day < today && dayFor(inc) === today ? t.day : dayFor(inc)
     const theirs: Record<EditField, string | undefined> = {
       title, notes: inc.notes?.trim() ?? '', category: inc.category?.trim() ?? '',
-      priority: inc.priority, deadline: inc.deadline ?? undefined, day: dayFor(inc),
+      priority: inc.priority, deadline: inc.deadline ?? undefined, day,
     }
     // A task ChatGPT cancels only gets the single "cancel?" decision, not field-by-field ones.
     if (inc.status !== 'cancelled') {
@@ -255,6 +271,12 @@ export function reconcile(state: State, plan: FullPlan, today: string, decisions
       }
     }
     if (patch.category) s = transition(s, { type: 'addCategory', name: patch.category }, today)
+    // Semantic hints (v2) can't be edited in NEXT, so they never conflict.
+    if (inc.status !== 'cancelled') {
+      for (const f of ['urgency', 'importance'] as const) {
+        if (inc[f] && inc[f] !== t[f]) { patch[f] = inc[f]; changed = true }
+      }
+    }
 
     let complete = false
     let cancel = false
@@ -318,12 +340,12 @@ const WEEKDAYS_DA = ['søndag', 'mandag', 'tirsdag', 'onsdag', 'torsdag', 'freda
 /** Reusable setup for a pinned ChatGPT conversation. */
 export function fullPlanSetupPrompt(): string {
   const example: FullPlan = {
-    next_full_plan: 1,
+    next_full_plan: 2,
     date: 'ÅÅÅÅ-MM-DD',
     tasks: [
-      { key: 'ring-banken', title: 'Ring til banken om lånet', notes: 'Spørg om rente', priority: 'high', deadline: 'ÅÅÅÅ-MM-DD', category: 'Økonomi', when: 'today', day: null, status: 'open' },
-      { key: 'svar-anna', title: 'Svar Anna', notes: null, priority: 'medium', deadline: null, category: null, when: 'today', day: null, status: 'done' },
-      { key: 'forny-pas', title: 'Book tid til nyt pas', notes: null, priority: 'low', deadline: null, category: null, when: 'later', day: 'ÅÅÅÅ-MM-DD', status: 'open' },
+      { key: 'ring-banken', title: 'Ring til banken om lånet', notes: 'Spørg om rente', priority: 'high', urgency: 'high', importance: 'high', deadline: 'ÅÅÅÅ-MM-DD', category: 'Økonomi', when: 'today', day: null, status: 'open' },
+      { key: 'svar-anna', title: 'Svar Anna', notes: null, priority: 'medium', urgency: 'medium', importance: 'low', deadline: null, category: null, when: 'today', day: null, status: 'done' },
+      { key: 'forny-pas', title: 'Book tid til nyt pas', notes: null, priority: 'low', urgency: 'low', importance: 'medium', deadline: null, category: null, when: 'later', day: 'ÅÅÅÅ-MM-DD', status: 'open' },
     ],
     ideas: [{ text: 'Lære at spille guitar' }],
   }
@@ -336,12 +358,15 @@ ${JSON.stringify(example, null, 2)}
 
 Regler:
 - "date" er den dag, planen gælder for (normalt i dag). Spørg mig om datoen/ugedagen, hvis du er i tvivl.
-- "tasks" står i den rækkefølge, jeg skal gøre dem. Vigtigste og letteste første skridt først.
+- "tasks" står i den rækkefølge, du foreslår. NEXT sorterer selv efter faste regler (frist, prioritet, hast, vigtighed, forsinkelse); din rækkefølge afgør kun ved lighed.
 - "key": et kort, stabilt ID med små bogstaver, tal og bindestreger. Samme opgave skal have SAMME key i alle planer, også hvis titlen ændres. Nye opgaver får en ny key. Gentagne opgaver (fx dagligt) får dato i key, fx "gaa-tur-2026-11-02".
 - "title": kort, konkret handling på dansk, der starter med et udsagnsord. Del store opgaver op i små skridt.
-- "when": "today", "tomorrow" eller "later". Ved "later" skal "day" være en dato (ÅÅÅÅ-MM-DD); ellers er "day" null.
+- "when": "today", "tomorrow" eller "later". Ved "later" skal "day" være en dato (ÅÅÅÅ-MM-DD); ellers er "day" null. Det er en fleksibel plan-dag, ikke en frist. Ufærdige opgaver fra tidligere dage bliver automatisk stående i NEXT; giv dem "today".
+- "deadline": KUN en hård frist med en reel konsekvens (fx betalingsfrist). Ellers null.
+- "urgency" (hvor tidskritisk) og "importance" (hvor meget det betyder): "high", "medium" eller "low". Vurder dem ud fra det, jeg fortæller – gæt ikke "high".
 - "status": "open"; "done" når jeg har sagt, at det er gjort; "cancelled" kun når jeg tydeligt siger, at noget ikke skal gøres.
 - Tag alle opgaver med, der stadig er relevante – også dem fra tidligere planer. Opgaver, du udelader, bliver ikke slettet i NEXT, men tag dem med for overblikkets skyld.
+- Opfind aldrig opgaver, datoer eller at noget er gjort. NEXT har ingen påmindelser, notifikationer eller synkronisering.
 - "priority": "high" kun ved tydelig hast eller konsekvens, ellers "medium" eller "low".
 - Vage ønsker og "måske engang" kommer i "ideas".
 - Ingen dubletter: hver opgave og hver key må kun optræde én gang.

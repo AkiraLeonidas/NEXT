@@ -45,7 +45,7 @@ test('documented schema file matches the code, and every task field is required'
 
 test('setup prompt asks for exactly this schema and covers Notion, keys and statuses', () => {
   const p = fullPlanSetupPrompt()
-  for (const s of ['"next_full_plan": 1', 'Notion', '"key"', 'SAMME key', '"status"', '"later"', 'NEXT-plan', 'ideas']) assert.ok(p.includes(s), s)
+  for (const s of ['"next_full_plan": 2', '"urgency"', '"importance"', 'Notion', '"key"', 'SAMME key', '"status"', '"later"', 'NEXT-plan', 'ideas']) assert.ok(p.includes(s), s)
   const example = JSON.parse(p.slice(p.indexOf('{'), p.indexOf('\n}\n') + 2).replaceAll('ÅÅÅÅ-MM-DD', TODAY))
   assert.ok(parseFullPlan(JSON.stringify(example), TODAY).ok, 'the example in the prompt is itself valid')
 })

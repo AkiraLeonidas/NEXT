@@ -1,5 +1,7 @@
 // Pure task logic + persistence. No React here, so it can be tested with `node --test`.
 
+import { movePatch, rankTasks } from './priority.ts'
+
 export type Priority = 'high' | 'medium' | 'low'
 export const PRIORITIES: Priority[] = ['high', 'medium', 'low']
 
@@ -14,8 +16,8 @@ export type Task = {
   category: string // '' = none
   priority?: Priority
   deadline?: string // YYYY-MM-DD
-  day: string // YYYY-MM-DD the task is planned for
-  order: number // position within its day
+  day: string // YYYY-MM-DD the task is planned for (flexible). Never changed by the daily rollover.
+  order: number // manual position; tie-breaker after the priority score
   done: boolean
   cancelled?: boolean // cancelled or deleted: hidden, but kept so its ID stays known
   createdAt: number
@@ -24,12 +26,21 @@ export type Task = {
   key?: string // ChatGPT's stable key for this task (full-plan imports)
   importRev?: Partial<Record<Field, number>> // revision at which a full-plan import last set/confirmed each field
   declined?: Partial<Record<Field, string>> // ChatGPT values the user rejected ("Keep mine"), so they don't ask again
+  urgency?: Priority // semantic urgency from ChatGPT (full plan v2)
+  importance?: Priority // semantic importance from ChatGPT (full plan v2)
+  pinnedAt?: number // "Do this now": pinned above everything, newest pin first
+  laterOn?: string // day the user tapped "Later"; sorts last for that day only
+  laterAt?: number
+  adjust?: number // score delta from a manual ↑/↓ move
 }
 
 export type Thought = { id: string; text: string; createdAt: number }
 
 /** A task ready to be added, e.g. from a reviewed AI import. */
-export type NewTask = { title: string; notes?: string; category?: string; priority?: Priority; deadline?: string; day?: string; id?: string }
+export type NewTask = {
+  title: string; notes?: string; category?: string; priority?: Priority; deadline?: string; day?: string; id?: string
+  urgency?: Priority; importance?: Priority
+}
 
 export type State = {
   tasks: Task[]
@@ -52,12 +63,12 @@ export type Action =
   | { type: 'toTop'; id: string }
   | { type: 'place'; id: string } // position among the day's open tasks by priority
   | { type: 'update'; id: string; patch: Partial<Pick<Task, 'title' | 'notes' | 'category' | 'priority' | 'deadline'>> }
+  | { type: 'autoOrder'; id: string } // drop pin, "Later" and manual moves
   | { type: 'remove'; id: string }
   | { type: 'capture'; text: string }
   | { type: 'dropThought'; id: string }
   | { type: 'thoughtToTask'; id: string }
   | { type: 'addCategory'; name: string }
-  | { type: 'rollover' }
 
 export const STORAGE_KEY = 'next.v1'
 export const BACKUP_KEY = 'next.v1.backup-before-ids'
@@ -84,6 +95,17 @@ export function dayKey(d: Date = new Date()): string {
   return `${d.getFullYear()}-${m}-${day}`
 }
 
+/** Milliseconds until the next local calendar day starts (DST-aware: uses local midnight, not +24h). */
+export function msUntilNextDay(now: Date = new Date()): number {
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+  return Math.max(1000, next.getTime() - now.getTime())
+}
+
+/** The device's IANA timezone, e.g. "Europe/Copenhagen" ('' if unknown). */
+export function timeZone(): string {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone ?? '' } catch { return '' }
+}
+
 export function addDays(day: string, n: number): string {
   const [y, m, d] = day.split('-').map(Number)
   return dayKey(new Date(y, m - 1, d + n))
@@ -102,22 +124,48 @@ export const isRealDate = (s: string) => {
   return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d
 }
 
-const byOrder = (a: Task, b: Task) => a.order - b.order
 const rank = (p?: Priority) => PRIORITIES.indexOf(p ?? 'medium')
 
-/** Visible tasks planned for a day (cancelled ones are hidden). */
+/** Visible tasks planned for a day (cancelled ones are hidden), ranked. */
 export function tasksFor(state: State, day: string): Task[] {
-  return state.tasks.filter((t) => t.day === day && !t.cancelled).sort(byOrder)
+  return rankTasks(state.tasks.filter((t) => t.day === day && !t.cancelled), day)
 }
 
-/** Open tasks for the day, in the order they should be worked on. */
+/** Open tasks scheduled exactly on `day`, ranked. */
 export function queue(state: State, day: string): Task[] {
   return tasksFor(state, day).filter((t) => !t.done)
 }
 
-export function progress(state: State, day: string) {
-  const all = tasksFor(state, day)
-  return { done: all.filter((t) => t.done).length, total: all.length }
+/**
+ * Daily rollover, derived (nothing is rewritten): every open task scheduled today or
+ * earlier is actionable today, ranked by the priority engine. Future tasks wait.
+ */
+export function nowQueue(state: State, today: string): Task[] {
+  return rankTasks(state.tasks.filter((t) => !t.done && !t.cancelled && t.day <= today), today)
+}
+
+export const isOverdue = (t: Task, today: string) => !t.done && !t.cancelled && t.day < today
+
+/** Local calendar day a task was completed on (falls back to its planned day for old data). */
+export const doneDay = (t: Task) => (t.doneAt ? dayKey(new Date(t.doneAt)) : t.day)
+
+/** Tasks completed today, plus today's scheduled tasks that are done. */
+export function doneToday(state: State, today: string): Task[] {
+  return state.tasks.filter((t) => t.done && !t.cancelled && (doneDay(t) === today || t.day === today)).sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
+}
+
+export function progress(state: State, today: string) {
+  const done = doneToday(state, today).length
+  return { done, total: done + nowQueue(state, today).length }
+}
+
+/** Open tasks per day for `today` + the next `n - 1` days. Today's count includes overdue tasks. */
+export function weekCounts(state: State, today: string, n = 7): { day: string; open: number; overdue: number }[] {
+  return Array.from({ length: n }, (_, i) => {
+    const day = addDays(today, i)
+    const open = state.tasks.filter((t) => !t.done && !t.cancelled && (i === 0 ? t.day <= day : t.day === day))
+    return { day, open: open.length, overdue: open.filter((t) => t.day < today).length }
+  })
 }
 
 const nextOrder = (tasks: Task[], day: string) =>
@@ -148,6 +196,8 @@ export function transition(state: State, action: Action, today: string): State {
       }
       if (action.priority) task.priority = action.priority
       if (action.deadline) task.deadline = action.deadline
+      if (action.urgency) task.urgency = action.urgency
+      if (action.importance) task.importance = action.importance
       return { ...state, seq, tasks: [...state.tasks, task] }
     }
     case 'import': {
@@ -161,45 +211,42 @@ export function transition(state: State, action: Action, today: string): State {
     case 'complete':
       return patchTask(state, action.id, { done: true, doneAt: Date.now() })
     case 'reopen':
-      return patchTask(state, action.id, { done: false, doneAt: undefined, day: today, order: nextOrder(state.tasks, today) })
+      // Keeps its date: an old task simply shows as overdue again.
+      return patchTask(state, action.id, { done: false, doneAt: undefined })
     case 'later': {
+      // Last in today's queue until tomorrow; the scheduled date is untouched.
       const task = state.tasks.find((t) => t.id === action.id)
       if (!task) return state
-      return patchTask(state, action.id, { order: nextOrder(state.tasks, task.day) })
+      const last = Math.max(0, ...state.tasks.filter((t) => t.laterOn === today).map((t) => t.laterAt ?? 0))
+      return patchTask(state, action.id, { pinnedAt: undefined, laterOn: today, laterAt: Math.max(Date.now(), last + 1) })
     }
     case 'tomorrow':
       return transition(state, { type: 'moveTo', id: action.id, day: addDays(today, 1) }, today)
     case 'moveTo':
-      return patchTask(state, action.id, { day: action.day, order: nextOrder(state.tasks, action.day) })
+      return patchTask(state, action.id, { day: action.day, order: nextOrder(state.tasks, action.day), laterOn: undefined, laterAt: undefined })
     case 'move': {
+      // Swap with the neighbour in the ranked list the user sees (today's queue, or that day's list).
       const task = state.tasks.find((t) => t.id === action.id)
-      if (!task || task.done) return state
-      const q = queue(state, task.day)
-      const i = q.findIndex((t) => t.id === task.id)
-      const other = q[i + action.dir]
-      if (!other) return state
-      return {
-        ...state,
-        tasks: state.tasks.map((t) =>
-          t.id === task.id ? { ...t, order: other.order } : t.id === other.id ? { ...t, order: task.order } : t,
-        ),
-      }
+      if (!task || task.done || task.cancelled) return state
+      const q = task.day <= today ? nowQueue(state, today) : queue(state, task.day)
+      const ref = task.day <= today ? today : task.day
+      const patch = movePatch(q, q.findIndex((t) => t.id === task.id), action.dir, ref)
+      return patch ? patchTask(state, task.id, patch) : state
     }
     case 'toTop': {
+      // Pin above everything. A future task is brought to today; an overdue one keeps its date.
       const task = state.tasks.find((t) => t.id === action.id)
       if (!task) return state
-      const min = Math.min(...tasksFor(state, today).map((t) => t.order), 1)
-      return patchTask(state, action.id, { day: today, order: min - 1, done: false, doneAt: undefined })
+      const top = Math.max(Date.now(), ...state.tasks.map((t) => (t.pinnedAt ?? 0) + 1))
+      return patchTask(state, action.id, { day: task.day > today ? today : task.day, pinnedAt: top, laterOn: undefined, laterAt: undefined, done: false, doneAt: undefined })
     }
+    case 'autoOrder':
+      return patchTask(state, action.id, { pinnedAt: undefined, laterOn: undefined, laterAt: undefined, adjust: undefined })
     case 'place': {
-      // After every open task of the same or higher priority, before the first lower one.
+      // The engine ranks by score; among equal scores a placed task goes last.
       const task = state.tasks.find((t) => t.id === action.id)
       if (!task || task.done) return state
-      const others = queue(state, task.day).filter((t) => t.id !== task.id)
-      const i = others.findIndex((t) => rank(t.priority) > rank(task.priority))
-      if (i < 0) return patchTask(state, task.id, { order: Math.max(0, ...others.map((t) => t.order)) + 1 })
-      const before = i > 0 ? others[i - 1].order : others[i].order - 1
-      return patchTask(state, task.id, { order: (before + others[i].order) / 2 })
+      return patchTask(state, task.id, { order: nextOrder(state.tasks.filter((t) => t.id !== task.id), task.day) })
     }
     case 'update': {
       const patch = { ...action.patch }
@@ -231,17 +278,6 @@ export function transition(state: State, action: Action, today: string): State {
       if (!name || state.categories.some((c) => c.toLowerCase() === name.toLowerCase())) return state
       return { ...state, categories: [...state.categories, name] }
     }
-    case 'rollover': {
-      // Unfinished tasks from past days move to the end of today, keeping their relative order.
-      const stale = state.tasks.filter((t) => !t.done && !t.cancelled && t.day < today).sort((a, b) => a.day.localeCompare(b.day) || byOrder(a, b))
-      if (!stale.length) return state
-      let order = nextOrder(state.tasks, today)
-      const moved = new Map(stale.map((t) => [t.id, order++]))
-      return {
-        ...state,
-        tasks: state.tasks.map((t) => (moved.has(t.id) ? { ...t, day: today, order: moved.get(t.id)! } : t)),
-      }
-    }
   }
 }
 
@@ -249,7 +285,7 @@ const sameValue = (a: unknown, b: unknown) => (a ?? '') === (b ?? '') || (a === 
 
 /**
  * Bumps the revision after a change. When the change was made by the user (not a
- * ChatGPT update or the automatic day rollover), records which task fields changed.
+ * ChatGPT update), records which task fields changed.
  */
 export function commit(prev: State, next: State, byUser: boolean): State {
   if (next === prev) return prev
@@ -268,7 +304,7 @@ export function commit(prev: State, next: State, byUser: boolean): State {
 
 /** Applies a user action and tracks the revision. */
 export function reduce(state: State, action: Action, today: string = dayKey()): State {
-  return commit(state, transition(state, action, today), action.type !== 'rollover')
+  return commit(state, transition(state, action, today), true)
 }
 
 /** Records an applied ChatGPT update fingerprint (bounded list). */
@@ -322,6 +358,9 @@ export function load(storage: KeyValueStore): State {
       state.seq = seq
     }
     if (!PRIORITIES.includes(task.priority as Priority)) delete task.priority
+    for (const k of ['urgency', 'importance'] as const) if (!PRIORITIES.includes(task[k] as Priority)) delete task[k]
+    for (const k of ['pinnedAt', 'laterAt', 'adjust'] as const) if (!isNum(task[k]) || task[k] === 0) delete task[k]
+    if (!isStr(task.laterOn) || !isRealDate(task.laterOn)) delete task.laterOn
     if (!isStr(task.deadline) || !isRealDate(task.deadline)) delete task.deadline
     if (task.cancelled !== true) delete task.cancelled
     for (const k of ['userRev', 'importRev', 'declined'] as const) if (typeof task[k] !== 'object' || task[k] === null) delete task[k]

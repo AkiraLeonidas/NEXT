@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import type { Action, KeyValueStore, State } from '../src/store.ts'
-import { STORAGE_KEY, addDays, emptyState, load, progress, queue, reduce, save } from '../src/store.ts'
+import { STORAGE_KEY, addDays, emptyState, load, nowQueue, progress, queue, reduce, save } from '../src/store.ts'
 
 const TODAY = '2026-10-31'
 const run = (actions: Action[], start: State = emptyState(), today = TODAY) =>
@@ -52,14 +52,15 @@ test('undo after done puts the task back on top', () => {
   assert.deepEqual(progress(s, TODAY), { done: 0, total: 3 })
 })
 
-test('move to tomorrow, then rollover brings unfinished tasks back next day', () => {
+test('move to tomorrow; next day unfinished tasks are actionable without changing their dates', () => {
   let s = abc()
   s = reduce(s, { type: 'tomorrow', id: idOf(s, 'A') }, TODAY)
   s = reduce(s, { type: 'complete', id: idOf(s, 'B') }, TODAY)
   assert.deepEqual(titles(s), ['C'])
   const tomorrow = addDays(TODAY, 1)
-  s = reduce(s, { type: 'rollover' }, tomorrow)
-  assert.deepEqual(titles(s, tomorrow), ['A', 'C'])
+  // C is overdue by one day (+2), so it comes before A.
+  assert.deepEqual(nowQueue(s, tomorrow).map((t) => t.title), ['C', 'A'])
+  assert.equal(s.tasks.find((t) => t.title === 'C')!.day, TODAY, 'overdue task keeps its date')
   assert.equal(s.tasks.find((t) => t.title === 'B')!.day, TODAY, 'done tasks stay on their day')
 })
 
