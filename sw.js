@@ -1,7 +1,7 @@
 // NEXT service worker: caches the app shell so it opens offline.
 // Pages: network first (fresh when online), cached copy when offline.
 // Assets (hashed filenames): cache first, saved on first fetch.
-const CACHE = 'next-v1'
+const CACHE = 'next-v2'
 const SHELL = ['./', './index.html', './manifest.webmanifest', './favicon.svg', './apple-touch-icon.png', './icon-192.png', './icon-512.png']
 
 self.addEventListener('install', (event) => {
