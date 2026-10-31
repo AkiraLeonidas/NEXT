@@ -6,13 +6,16 @@ import BrainDump from './BrainDump.tsx'
 import SyncView from './Sync.tsx'
 import type { UpdatePayload } from './ai/sync.ts'
 import { applyUpdate, execute, summarize } from './ai/sync.ts'
+import type { Decisions, FullPlan } from './ai/fullplan.ts'
+import { applyFullPlan, reconcile, summarizePlan } from './ai/fullplan.ts'
 
 type Tab = 'now' | 'today' | 'inbox' | 'dump' | 'chat'
 
 type AppAction =
   | Action
   | { type: 'applyUpdate'; update: UpdatePayload; hash: string; accept: string[] }
-  | { type: 'restore'; state: State } // undo a whole ChatGPT update
+  | { type: 'applyPlan'; plan: FullPlan; hash: string; decisions: Decisions }
+  | { type: 'restore'; state: State } // undo a whole ChatGPT update or plan
 
 type Notice = { text: string; undo?: () => void }
 
@@ -28,6 +31,7 @@ function taskMeta(t: Task, today: string): string[] {
 
 function appReducer(s: State, a: AppAction): State {
   if (a.type === 'applyUpdate') return applyUpdate(s, a.update, a.hash, new Set(a.accept), dayKey())
+  if (a.type === 'applyPlan') return applyFullPlan(s, a.plan, a.hash, a.decisions, dayKey())
   if (a.type === 'restore') return { ...a.state, rev: s.rev + 1 } // revisions only ever increase
   return reduce(s, a, dayKey())
 }
@@ -75,6 +79,14 @@ export default function App() {
     setTab('now')
   }
 
+  const applyChatPlan = (plan: FullPlan, hash: string, decisions: Decisions) => {
+    const before = state
+    const result = reconcile(state, plan, today, decisions)
+    dispatch({ type: 'applyPlan', plan, hash, decisions })
+    setNotice({ text: result.ok ? summarizePlan(result.counts) : 'Day planned', undo: () => dispatch({ type: 'restore', state: before }) })
+    setTab('now')
+  }
+
   const detail = state.tasks.find((t) => t.id === detailId && !t.cancelled)
 
   return (
@@ -88,7 +100,7 @@ export default function App() {
             onFinished={() => { setDumpReply(null); setTab('today') }} />
         )}
         {tab === 'chat' && (
-          <SyncView state={state} today={today} onApply={applyChatUpdate}
+          <SyncView state={state} today={today} onApply={applyChatUpdate} onApplyPlan={applyChatPlan}
             onAlready={() => { setNotice({ text: 'Already applied ✓' }); setTab('now') }}
             onDump={(raw) => { setDumpReply({ raw, n: Date.now() }); setTab('dump') }}
             onOpenDump={() => { setDumpReply(null); setTab('dump') }} />

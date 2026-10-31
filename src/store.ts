@@ -21,6 +21,9 @@ export type Task = {
   createdAt: number
   doneAt?: number
   userRev?: Partial<Record<Field, number>> // state revision of the last manual change per field
+  key?: string // ChatGPT's stable key for this task (full-plan imports)
+  importRev?: Partial<Record<Field, number>> // revision at which a full-plan import last set/confirmed each field
+  declined?: Partial<Record<Field, string>> // ChatGPT values the user rejected ("Keep mine"), so they don't ask again
 }
 
 export type Thought = { id: string; text: string; createdAt: number }
@@ -67,7 +70,7 @@ export const emptyState = (): State => ({ tasks: [], thoughts: [], categories: [
 const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 
 /** Next free NEXT-created task ID: t1, t2, … */
-function nextTaskId(state: State, alsoUsed: Set<string> = new Set()): { id: string; seq: number } {
+export function nextTaskId(state: State, alsoUsed: Set<string> = new Set()): { id: string; seq: number } {
   const used = new Set([...alsoUsed, ...state.tasks.map((t) => t.id)])
   let seq = state.seq
   do seq++
@@ -321,7 +324,8 @@ export function load(storage: KeyValueStore): State {
     if (!PRIORITIES.includes(task.priority as Priority)) delete task.priority
     if (!isStr(task.deadline) || !isRealDate(task.deadline)) delete task.deadline
     if (task.cancelled !== true) delete task.cancelled
-    if (typeof task.userRev !== 'object' || task.userRev === null) delete task.userRev
+    for (const k of ['userRev', 'importRev', 'declined'] as const) if (typeof task[k] !== 'object' || task[k] === null) delete task[k]
+    if (!isStr(task.key)) delete task.key
     seen.add(task.id)
     state.tasks.push(task)
   })

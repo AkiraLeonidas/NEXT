@@ -52,15 +52,16 @@ const OP_FIELDS: Record<UpdateOp['op'], { required: string[]; optional: string[]
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
-export type Kind = 'update' | 'dump' | 'plan' | 'none'
+export type Kind = 'fullplan' | 'update' | 'dump' | 'plan' | 'none'
 
-/** What kind of JSON the user pasted: a v2 update, a v1 brain dump answer, the plan itself, or nothing usable. */
+/** What kind of JSON the user pasted: a full plan, a v2 update, a v1 brain dump answer, NEXT's own snapshot, or nothing usable. */
 export function detectKind(raw: string): Kind {
   const json = extractJson(raw)
   if (!json) return 'none'
   try {
     const data = JSON.parse(json)
     if (!isObj(data)) return 'none'
+    if ('next_full_plan' in data) return 'fullplan'
     if ('next_update' in data) return 'update'
     if ('next_plan' in data) return 'plan'
     if ('version' in data && ('tasks' in data || 'ideas' in data)) return 'dump'
